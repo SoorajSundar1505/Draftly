@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS drafts (
     bcc_emails TEXT[],
     body_text TEXT,
     body_html TEXT,
+    status VARCHAR(50) DEFAULT 'PENDING_REVIEW',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, draft_id)

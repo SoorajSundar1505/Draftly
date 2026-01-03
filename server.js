@@ -6,6 +6,7 @@ require('dotenv').config();
 const authRoutes = require('./routes/auth');
 const healthRoutes = require('./routes/health');
 const gmailRoutes = require('./routes/gmail');
+const draftsRoutes = require('./routes/drafts');
 const { apiLimiter } = require('./middleware/rateLimit');
 const { logRequest, logError } = require('./middleware/logger');
 
@@ -38,6 +39,7 @@ app.use('/api', apiLimiter);
 app.use('/auth', authRoutes);
 app.use('/health', healthRoutes);
 app.use('/gmail', gmailRoutes);
+app.use('/drafts', draftsRoutes);
 
 // Root endpoint
 app.get('/', (req, res) => {
@@ -52,6 +54,10 @@ app.get('/', (req, res) => {
       },
       gmail: {
         sync: 'POST /gmail/sync'
+      },
+      drafts: {
+        generate: 'POST /drafts/generate',
+        send: 'POST /drafts/send'
       }
     }
   });
