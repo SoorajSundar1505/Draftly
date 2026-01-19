@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS drafts (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     draft_id VARCHAR(255) NOT NULL,
+    message_id VARCHAR(255),
     thread_id VARCHAR(255),
     subject TEXT,
     to_emails TEXT[],
@@ -46,7 +47,8 @@ CREATE TABLE IF NOT EXISTS drafts (
     status VARCHAR(50) DEFAULT 'PENDING_REVIEW',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(user_id, draft_id)
+    UNIQUE(user_id, draft_id),
+    UNIQUE(user_id, message_id)
 );
 
 -- Logs table

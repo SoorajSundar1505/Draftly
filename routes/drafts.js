@@ -4,13 +4,12 @@ const router = express.Router();
 
 const pool = require('../config/database');
 const { authenticate } = require('../middleware/auth');
-const { generateDraftReply, buildPrompt } = require('../services/mockLLM');
-const { extractPlainText, extractHtmlText, cleanEmailContent, extractEmailAddress } = require('../utils/emailContent');
-const { ensureLabelsExist, applyLabel, removeLabel, getMessagesWithLabel } = require('../utils/gmailLabels');
+const { publish: publishToPubSub } = require('../services/pubsub');
+const { ensureLabelsExist, removeLabel, getMessagesWithLabel } = require('../utils/gmailLabels');
 
 /**
  * POST /drafts/generate
- * Generates a draft reply for a Gmail message using LLM
+ * Queues a draft generation request via Pub/Sub
  * Body: { "messageId": "<gmail_message_id>" }
  */
 router.post('/generate', authenticate, async (req, res) => {
@@ -25,151 +24,61 @@ router.post('/generate', authenticate, async (req, res) => {
   }
 
   try {
-    const gmail = google.gmail({ version: 'v1', auth: req.oauth2Client });
-
-    // Ensure required labels exist
-    await ensureLabelsExist(gmail, ['LLM-Review', 'Send-Now']);
-
-    // Fetch full email from Gmail
-    const messageResponse = await gmail.users.messages.get({
-      userId: 'me',
-      id: messageId,
-      format: 'full'
-    });
-
-    const message = messageResponse.data;
-    const payload = message.payload;
-    const headers = payload.headers || [];
-
-    // Extract email metadata
-    let subject = '';
-    let fromEmail = '';
-    let toEmail = req.user.email; // Reply to the authenticated user's email
-    let threadId = message.threadId || null;
-
-    for (const header of headers) {
-      if (header.name === 'Subject') {
-        subject = header.value || '';
-      } else if (header.name === 'From') {
-        fromEmail = header.value || '';
-      } else if (header.name === 'To') {
-        toEmail = header.value || req.user.email;
-      }
-    }
-
-    // Extract email body
-    let emailBody = extractPlainText(payload);
-    if (!emailBody) {
-      // Fallback to HTML if no plain text
-      const htmlBody = extractHtmlText(payload);
-      if (htmlBody) {
-        // Simple HTML to text conversion (remove tags)
-        emailBody = htmlBody.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-      }
-    }
-
-    if (!emailBody) {
-      return res.status(400).json({
-        error: 'Bad Request',
-        message: 'Could not extract email body content'
-      });
-    }
-
-    // Clean email content
-    const cleanedBody = cleanEmailContent(emailBody, 5000);
-
-    // Build prompt and generate draft reply using mock LLM
-    const prompt = buildPrompt(cleanedBody, subject, fromEmail);
-    const draftBody = await generateDraftReply(cleanedBody, subject, fromEmail);
-
-    // Extract reply-to email address
-    const replyToEmail = extractEmailAddress(fromEmail);
-    if (!replyToEmail) {
-      return res.status(400).json({
-        error: 'Bad Request',
-        message: 'Could not extract sender email address'
-      });
-    }
-
-    // Create reply subject (add Re: if not present)
-    const replySubject = subject.startsWith('Re:') || subject.startsWith('RE:') 
-      ? subject 
-      : `Re: ${subject}`;
-
-    // Create Gmail draft
-    const draftResponse = await gmail.users.drafts.create({
-      userId: 'me',
-      requestBody: {
-        message: {
-          threadId: threadId,
-          raw: Buffer.from(
-            `To: ${replyToEmail}\r\n` +
-            `Subject: ${replySubject}\r\n` +
-            `Content-Type: text/plain; charset=utf-8\r\n` +
-            `\r\n` +
-            `${draftBody}`
-          ).toString('base64')
-        }
-      }
-    });
-
-    const draftId = draftResponse.data.id;
-    const createdDraft = draftResponse.data.message;
-
-    // Apply LLM-Review label to the draft
-    try {
-      const labels = await ensureLabelsExist(gmail, ['LLM-Review']);
-      if (labels['LLM-Review']) {
-        await applyLabel(gmail, createdDraft.id, labels['LLM-Review']);
-      }
-    } catch (labelError) {
-      console.error('Error applying LLM-Review label:', labelError);
-      // Continue even if label application fails
-    }
-
-    // Store draft metadata in database
-    await pool.query(
-      `INSERT INTO drafts (user_id, draft_id, thread_id, subject, to_emails, body_text, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (user_id, draft_id) 
-       DO UPDATE SET 
-         thread_id = EXCLUDED.thread_id,
-         subject = EXCLUDED.subject,
-         to_emails = EXCLUDED.to_emails,
-         body_text = EXCLUDED.body_text,
-         status = EXCLUDED.status,
-         updated_at = CURRENT_TIMESTAMP`,
-      [
-        userId,
-        draftId,
-        threadId,
-        replySubject,
-        [replyToEmail],
-        draftBody,
-        'PENDING_REVIEW'
-      ]
+    // Check for existing draft to prevent duplicates (idempotency)
+    const existingDraft = await pool.query(
+      `SELECT draft_id, status FROM drafts 
+       WHERE user_id = $1 AND message_id = $2 AND status != 'SENT'`,
+      [userId, messageId]
     );
 
-    // Log success
+    if (existingDraft.rows.length > 0) {
+      return res.status(409).json({
+        error: 'Conflict',
+        message: 'A draft for this message already exists and is pending review',
+        draftId: existingDraft.rows[0].draft_id,
+        status: existingDraft.rows[0].status
+      });
+    }
+
+    // Verify message exists in our database (optional but good for validation)
+    const messageCheck = await pool.query(
+      `SELECT message_id FROM messages WHERE user_id = $1 AND message_id = $2`,
+      [userId, messageId]
+    );
+
+    if (messageCheck.rows.length === 0) {
+      return res.status(404).json({
+        error: 'Not Found',
+        message: 'Message not found. Please sync Gmail messages first using POST /gmail/sync'
+      });
+    }
+
+    // Publish to Pub/Sub for async processing
+    const pubsubMessageId = await publishToPubSub({
+      userId: userId,
+      messageId: messageId
+    });
+
+    // Log request
     try {
       await pool.query(
         `INSERT INTO logs (user_id, action, endpoint, method, status_code)
          VALUES ($1, $2, $3, $4, $5)`,
-        [userId, 'draft_generate', '/drafts/generate', 'POST', 200]
+        [userId, 'draft_generate_queued', '/drafts/generate', 'POST', 200]
       );
     } catch (logError) {
-      console.error('Error logging draft generation:', logError);
+      console.error('Error logging draft generation request:', logError);
     }
 
     return res.json({
       success: true,
-      draftId: draftId,
-      message: 'Draft generated successfully and labeled for review',
-      status: 'PENDING_REVIEW'
+      status: 'QUEUED',
+      message: 'Draft generation request queued successfully',
+      pubsubMessageId: pubsubMessageId
     });
 
   } catch (error) {
-    console.error('Error generating draft:', error);
+    console.error('Error queueing draft generation:', error);
 
     // Log error
     try {
@@ -178,7 +87,7 @@ router.post('/generate', authenticate, async (req, res) => {
          VALUES ($1, $2, $3, $4, $5, $6)`,
         [
           userId,
-          'draft_generate',
+          'draft_generate_queued',
           '/drafts/generate',
           'POST',
           500,
@@ -191,7 +100,7 @@ router.post('/generate', authenticate, async (req, res) => {
 
     return res.status(500).json({
       error: 'Internal Server Error',
-      message: 'Failed to generate draft',
+      message: 'Failed to queue draft generation',
       details: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
