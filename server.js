@@ -5,8 +5,11 @@ require('dotenv').config();
 
 const authRoutes = require('./routes/auth');
 const healthRoutes = require('./routes/health');
+const gmailRoutes = require('./routes/gmail');
+const draftsRoutes = require('./routes/drafts');
 const { apiLimiter } = require('./middleware/rateLimit');
 const { logRequest, logError } = require('./middleware/logger');
+const { initialize: initializePubSub } = require('./services/pubsub');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -36,6 +39,8 @@ app.use('/api', apiLimiter);
 // Routes
 app.use('/auth', authRoutes);
 app.use('/health', healthRoutes);
+app.use('/gmail', gmailRoutes);
+app.use('/drafts', draftsRoutes);
 
 // Root endpoint
 app.get('/', (req, res) => {
@@ -47,6 +52,13 @@ app.get('/', (req, res) => {
       auth: {
         gmail: 'POST /auth/gmail',
         callback: 'GET /auth/callback'
+      },
+      gmail: {
+        sync: 'POST /gmail/sync'
+      },
+      drafts: {
+        generate: 'POST /drafts/generate',
+        send: 'POST /drafts/send'
       }
     }
   });
@@ -68,6 +80,11 @@ app.use((req, res) => {
     error: 'Not Found',
     message: `Route ${req.method} ${req.path} not found`
   });
+});
+
+// Initialize Pub/Sub (non-blocking)
+initializePubSub().catch(err => {
+  console.warn('⚠️  Pub/Sub initialization failed (will use local queue):', err.message);
 });
 
 // Start server
