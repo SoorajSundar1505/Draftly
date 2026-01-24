@@ -120,8 +120,24 @@ async function subscribe(messageHandler) {
     // Use Google Cloud Pub/Sub
     const messageHandlerWrapper = async (message) => {
       try {
-        const data = message.json;
+        // Parse JSON data from Pub/Sub message
+        let data;
+        try {
+          // Try to get JSON data (preferred method for Pub/Sub)
+          data = message.json;
+          if (!data) {
+            // Fallback: manually parse from Buffer if json is not available
+            const dataString = message.data.toString('utf8');
+            data = JSON.parse(dataString);
+          }
+        } catch (parseError) {
+          console.error('Error parsing Pub/Sub message data:', parseError);
+          console.error('Raw message:', message.data.toString());
+          throw new Error(`Invalid message format: ${parseError.message}`);
+        }
+        
         console.log(`📥 Received message from Pub/Sub: ${message.id}`);
+        console.log(`   Data:`, data);
         
         await messageHandler({
           id: message.id,
